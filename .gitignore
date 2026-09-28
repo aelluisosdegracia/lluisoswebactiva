@@ -1,0 +1,29 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Entorns virtuals
+.venv/
+venv/
+ENV/
+env/
+
+# Variables d'entorn i credencials privades
+.env
+credentials.json
+service_account.json
+
+# Fitxers de dades locals generats
+kiniela_submissions.json
+data/.secret_key
+*.tmp*
+*.bak
+
+# IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+

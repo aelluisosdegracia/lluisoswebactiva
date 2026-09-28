@@ -1,0 +1,2067 @@
+import os
+import json
+import logging
+import datetime
+import hashlib
+import hmac
+import uuid
+import secrets
+import threading
+import requests
+import unicodedata
+import re
+import html
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# ==============================================================================
+# CYBERSECURITY & DATA FILTRATION (Anti-XSS, Script & Payload Sanitization)
+# ==============================================================================
+
+def sanitize_formula_value(val):
+    """
+    Prevents CSV / Google Sheets Formula Injection (CSV DDE Injection / CVE-2014-3524).
+    Neutralizes formula execution triggers (=, +, -, @, \t, \r) by prepending a single quote (').
+    """
+    if val is None:
+        return ""
+    val_str = str(val).strip()
+    if val_str and val_str[0] in ('=', '+', '-', '@', '\t', '\r'):
+        return "'" + val_str
+    return val_str
+
+def sanitize_text(value, max_length=1000, allow_newlines=False):
+    """
+    Sanitizes user text inputs:
+    - Removes null bytes and control chars.
+    - Strips dangerous <script>, <iframe>, <object>, <embed>, <svg>, etc.
+    - Strips 'javascript:', 'data:', 'vbscript:' URIs.
+    - Strips HTML event handlers ('onerror=', 'onload=', 'onclick=', etc.).
+    - Strips raw HTML tags and escapes remaining HTML entities.
+    - Truncates to max_length to prevent payload overflows.
+    """
+    if value is None:
+        return ""
+    val_str = str(value).strip()
+    val_str = val_str.replace('\x00', '')
+    # Strip script blocks completely
+    val_str = re.sub(r'(?is)<script.*?>.*?</script>', '', val_str)
+    # Strip dangerous HTML tags
+    val_str = re.sub(r'(?is)<(iframe|object|embed|svg|link|meta|style|form|input|button|applet|base).*?>.*?</\1>', '', val_str)
+    # Strip remaining HTML tags
+    val_str = re.sub(r'<[^>]+>', '', val_str)
+    # Neutralize javascript/data pseudo-protocols
+    val_str = re.sub(r'(?i)(javascript|vbscript|data):', '', val_str)
+    # Neutralize inline event handlers
+    val_str = re.sub(r'(?i)\bon\w+\s*=', '', val_str)
+    # Escape entities
+    val_str = html.escape(val_str, quote=True)
+    if not allow_newlines:
+        val_str = re.sub(r'[\r\n]+', ' ', val_str)
+    return val_str[:max_length].strip()
+
+def sanitize_url(url, default='/static/images/backgroundmountains.png'):
+    """
+    Validates and sanitizes media/resource URLs:
+    - Rejects dangerous schemes: javascript:, data:, vbscript:, file:
+    - Prevents quote breakouts and tag injection.
+    - Accepts valid local paths (/static/...) or http/https URLs.
+    """
+    if not url or not isinstance(url, str):
+        return default
+    clean = str(url).strip()
+    clean = clean.replace('\x00', '')
+    if re.search(r'^(javascript|data|vbscript|file):', clean, re.I):
+        return default
+    if any(ch in clean for ch in ['<', '>', '"', "'", '`', '{', '}']):
+        return default
+    if not (clean.startswith('/') or clean.startswith('http://') or clean.startswith('https://')):
+        return default
+    return clean[:500]
+
+def sanitize_float(value, default=0.0, min_val=None, max_val=None):
+    """Safely parses float with boundary checks."""
+    try:
+        val = float(value)
+        if min_val is not None and val < min_val:
+            return min_val
+        if max_val is not None and val > max_val:
+            return max_val
+        return val
+    except (ValueError, TypeError):
+        return default
+
+def sanitize_int(value, default=0, min_val=None, max_val=None):
+    """Safely parses integer with boundary checks."""
+    try:
+        val = int(value)
+        if min_val is not None and val < min_val:
+            return min_val
+        if max_val is not None and val > max_val:
+            return max_val
+        return val
+    except (ValueError, TypeError):
+        return default
+
+def sanitize_hex_color(color, default='#0B2545'):
+    """Validates 3 or 6 hex digit CSS color strings."""
+    if not color or not isinstance(color, str):
+        return default
+    color_str = str(color).strip()
+    if re.match(r'^#(?:[0-9a-fA-F]{3}){1,2}$', color_str):
+        return color_str
+    return default
+
+def sanitize_data_struct(item, max_depth=5):
+    """
+    Recursively sanitizes JSON data structures (dicts, lists, primitives)
+    to prevent script or HTML injection in nested JSON payloads (e.g. kiniela assignments).
+    """
+    if max_depth <= 0:
+        return ""
+    if isinstance(item, dict):
+        return {
+            sanitize_formula_value(sanitize_text(k, max_length=100)): sanitize_data_struct(v, max_depth - 1)
+            for k, v in item.items()
+        }
+    elif isinstance(item, list):
+        return [sanitize_data_struct(x, max_depth - 1) for x in item]
+    elif isinstance(item, str):
+        return sanitize_formula_value(sanitize_text(item, max_length=1000, allow_newlines=True))
+    elif isinstance(item, (int, float, bool)) or item is None:
+        return item
+    return sanitize_formula_value(sanitize_text(str(item), max_length=500))
+
+class GSheetsDB:
+    def __init__(self, credentials_path="credentials.json", sheet_name="AE_Lluisos_Database"):
+        self.credentials_path = os.getenv("GOOGLE_APPLICATION_CREDENTIALS", credentials_path)
+        self.sheet_name = os.getenv("GSHEET_NAME", sheet_name)
+        self.client = None
+        self.base_dir = os.path.dirname(os.path.abspath(__file__))
+        self.data_dir = os.path.join(self.base_dir, "data")
+        self._lock = threading.RLock()
+        os.makedirs(self.data_dir, exist_ok=True)
+        self._init_client()
+        self._init_json_store()
+
+    def _data_file(self, filename):
+        safe_name = os.path.basename(str(filename).strip())
+        if not safe_name or safe_name != filename or not safe_name.endswith('.json'):
+            raise ValueError(f"Security: Nom de fitxer invàlid '{filename}'")
+        full_path = os.path.abspath(os.path.join(self.data_dir, safe_name))
+        if not full_path.startswith(os.path.abspath(self.data_dir)):
+            raise ValueError(f"Security: Intent de path traversal detectat '{filename}'")
+        return full_path
+
+    def _read_data(self, filename, default_val=None):
+        with self._lock:
+            try:
+                filepath = self._data_file(filename)
+                if os.path.exists(filepath):
+                    if os.path.getsize(filepath) == 0:
+                        logger.warning(f"Fitxer {filepath} buit. Utilitzant valor per defecte.")
+                        return default_val if default_val is not None else []
+                    with open(filepath, "r", encoding="utf-8") as f:
+                        return json.load(f)
+            except Exception as e:
+                logger.warning(f"Error llegint {filename}: {e}")
+            return default_val if default_val is not None else []
+
+    def _write_data(self, filename, data):
+        with self._lock:
+            try:
+                filepath = self._data_file(filename)
+                temp_path = f"{filepath}.tmp.{os.getpid()}.{threading.get_ident()}"
+                with open(temp_path, "w", encoding="utf-8") as f:
+                    json.dump(data, f, indent=2, ensure_ascii=False)
+                    f.flush()
+                    os.fsync(f.fileno())
+                os.replace(temp_path, filepath)
+                return True
+            except Exception as e:
+                logger.error(f"Error escrivint {filename}: {e}")
+                if 'temp_path' in locals() and os.path.exists(temp_path):
+                    try:
+                        os.remove(temp_path)
+                    except OSError:
+                        pass
+                return False
+
+    def _init_json_store(self):
+        """Initializes JSON data storage from defaults if files do not already exist."""
+        # 1. Password verification store
+        contra_file = self._data_file("contra.json")
+        if not os.path.exists(contra_file):
+            salt = "ae_lluisos_gracia_salt_2026"
+            default_hash = hashlib.sha256((salt + "caps2026").encode('utf-8')).hexdigest()
+            self._write_data("contra.json", {
+                "algorithm": "sha256_salted",
+                "salt": salt,
+                "contra_hash": default_hash,
+                "note": "AE Lluïsos de Gràcia - Contrasenya per defecte: caps2026"
+            })
+
+        # 2. Novetats store
+        novetats_file = self._data_file("novetats.json")
+        if not os.path.exists(novetats_file):
+            self._write_data("novetats.json", self._default_novetats())
+
+        # 3. Calendari store
+        cal_file = self._data_file("calendari.json")
+        if not os.path.exists(cal_file):
+            self._write_data("calendari.json", self._default_calendar_events())
+
+        # 4. Foulard pins store
+        foulard_file = self._data_file("foulard.json")
+        if not os.path.exists(foulard_file):
+            self._write_data("foulard.json", self._default_foulard_pins())
+
+        # 5. Shop store
+        shop_file = self._data_file("shop.json")
+        if not os.path.exists(shop_file):
+            self._write_data("shop.json", self._default_shop_products())
+
+        # 6. Caps store
+        caps_file = self._data_file("caps.json")
+        if not os.path.exists(caps_file):
+            self._write_data("caps.json", self._default_caps())
+
+        # 7. Cims store
+        cims_file = self._data_file("cims.json")
+        if not os.path.exists(cims_file) or os.path.getsize(cims_file) == 0:
+            static_cims = os.path.join(self.base_dir, 'static', 'data', 'cims.json')
+            if os.path.exists(static_cims):
+                try:
+                    with open(static_cims, 'r', encoding='utf-8') as f:
+                        self._write_data("cims.json", json.load(f))
+                except Exception:
+                    pass
+
+        # 8. Kiniela submissions store
+        kiniela_file = self._data_file("kiniela_submissions.json")
+        if not os.path.exists(kiniela_file):
+            self._write_data("kiniela_submissions.json", [])
+
+    def verify_contra(self, password):
+        """Verify password against data/contra.json with timing-attack mitigation and Werkzeug support."""
+        if not password:
+            return False
+        data = self._read_data("contra.json", None)
+        if not data or not isinstance(data, dict):
+            return False
+        
+        algo = data.get("algorithm", "sha256_salted")
+        stored_hash = str(data.get("contra_hash", ""))
+        
+        # 1. Modern Werkzeug hash check (scrypt or pbkdf2)
+        if algo in ("werkzeug", "scrypt", "pbkdf2") or stored_hash.startswith(("scrypt:", "pbkdf2:")):
+            try:
+                from werkzeug.security import check_password_hash
+                return check_password_hash(stored_hash, str(password).strip())
+            except Exception as e:
+                logger.warning(f"Werkzeug password check failed: {e}")
+
+        # 2. Legacy salted sha256 check with constant-time comparison
+        salt = data.get("salt", "ae_lluisos_gracia_salt_2026")
+        computed = hashlib.sha256((salt + str(password).strip()).encode('utf-8')).hexdigest()
+        if hmac.compare_digest(computed, stored_hash):
+            # Auto-upgrade to Werkzeug hash
+            try:
+                self.set_contra(password)
+                logger.info("Auto-upgraded master password hash to modern Werkzeug format.")
+            except Exception as e:
+                logger.warning(f"Could not auto-upgrade password hash: {e}")
+            return True
+            
+        return False
+
+    def set_contra(self, new_password):
+        """Update password in data/contra.json with sanitization and modern Werkzeug hash."""
+        clean_pwd = str(new_password).replace('\x00', '').strip()[:100]
+        if not clean_pwd or len(clean_pwd) < 4:
+            return False
+        try:
+            from werkzeug.security import generate_password_hash
+            hashed = generate_password_hash(clean_pwd)
+            payload = {
+                "algorithm": "werkzeug",
+                "contra_hash": hashed,
+                "note": "AE Lluïsos de Gràcia - Contrasenya mestra xifrada amb Werkzeug (scrypt/pbkdf2)",
+                "updated_at": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            }
+        except Exception:
+            salt = "ae_lluisos_gracia_salt_2026"
+            computed = hashlib.sha256((salt + clean_pwd).encode('utf-8')).hexdigest()
+            payload = {
+                "algorithm": "sha256_salted",
+                "salt": salt,
+                "contra_hash": computed,
+                "updated_at": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            }
+        return self._write_data("contra.json", payload)
+
+
+    def _init_client(self):
+        """Initializes gspread client if credentials file is present."""
+        if os.path.exists(self.credentials_path):
+            try:
+                import gspread
+                self.client = gspread.service_account(filename=self.credentials_path)
+                logger.info("Successfully connected to Google Sheets API with gspread.")
+            except Exception as e:
+                logger.warning(f"gspread initialization failed: {e}. Falling back to CSV/Mock data.")
+                self.client = None
+        else:
+            logger.info(f"No Google credentials found at '{self.credentials_path}'. Using dynamic fallback dataset.")
+
+    def _fetch_sheet_records(self, worksheet_name):
+        """Fetches records from Google Sheets if available, else returns None."""
+        if self.client:
+            try:
+                sheet = self.client.open(self.sheet_name).worksheet(worksheet_name)
+                return sheet.get_all_records()
+            except Exception as e:
+                logger.warning(f"Error fetching worksheet '{worksheet_name}' via gspread: {e}")
+
+        # Check for published CSV URLs via environment variables
+        csv_url = os.getenv(f"GSHEET_CSV_{worksheet_name.upper()}")
+        if csv_url:
+            try:
+                import csv
+                import io
+                resp = requests.get(csv_url, timeout=5)
+                if resp.status_code == 200:
+                    reader = csv.DictReader(io.StringIO(resp.text))
+                    return list(reader)
+            except Exception as e:
+                logger.warning(f"Error fetching CSV for worksheet '{worksheet_name}': {e}")
+        
+        return None
+
+    def get_kiniela_submissions(self):
+        """Fetch all Kiniela predictions sorted newest first."""
+        records = self._read_data("kiniela_submissions.json", [])
+        if not isinstance(records, list):
+            records = []
+        return sorted(records, key=lambda x: str(x.get("timestamp", "")), reverse=True)
+
+    def delete_kiniela_submission(self, submission_id):
+        """Safely delete a Kiniela submission by integer ID or UUID."""
+        with self._lock:
+            submissions = self._read_data("kiniela_submissions.json", [])
+            if not isinstance(submissions, list):
+                return False
+            initial_count = len(submissions)
+            target = str(submission_id).strip()
+            filtered = [
+                s for s in submissions
+                if str(s.get("id")) != target and str(s.get("uuid")) != target
+            ]
+            if len(filtered) < initial_count:
+                self._write_data("kiniela_submissions.json", filtered)
+                logger.info(f"Kiniela submission #{submission_id} eliminada correctament.")
+                return True
+            return False
+
+    def save_kiniela(self, creator_name, kiniela_data, client_ip=None, user_agent=None):
+        """
+        Save a new Kiniela prediction to local JSON store and Google Sheets (Worksheet: 'Kiniela')
+        with comprehensive cybersecurity sanitization, anti-formula injection, and rate/size validation.
+        """
+        clean_creator = sanitize_text(creator_name, max_length=60)
+        if not clean_creator:
+            clean_creator = 'Anònim/a'
+        clean_creator = sanitize_formula_value(clean_creator)
+
+        # Validate kiniela_data structure
+        clean_assignments = {}
+        total_assigned = 0
+        if isinstance(kiniela_data, dict):
+            for group, members in list(kiniela_data.items())[:12]:
+                group_clean = sanitize_text(group, max_length=50)
+                group_clean = sanitize_formula_value(group_clean)
+                if not group_clean:
+                    continue
+                if isinstance(members, list):
+                    clean_members = []
+                    for m in members[:30]:
+                        clean_m = sanitize_text(m, max_length=60)
+                        clean_m = sanitize_formula_value(clean_m)
+                        if clean_m:
+                            clean_members.append(clean_m)
+                            total_assigned += 1
+                    clean_assignments[group_clean] = clean_members
+                elif isinstance(members, str):
+                    clean_m = sanitize_text(members, max_length=60)
+                    clean_m = sanitize_formula_value(clean_m)
+                    if clean_m:
+                        clean_assignments[group_clean] = [clean_m]
+                        total_assigned += 1
+
+        timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        submission_uuid = uuid.uuid4().hex[:12]
+        ip_hash = None
+        if client_ip:
+            ip_hash = hashlib.sha256(f"ae_kiniela_ip_{client_ip}".encode()).hexdigest()[:12]
+
+        saved_online = False
+        if self.client:
+            try:
+                spreadsheet = self.client.open(self.sheet_name)
+                try:
+                    worksheet = spreadsheet.worksheet("Kiniela")
+                except Exception:
+                    worksheet = spreadsheet.add_worksheet(title="Kiniela", rows="500", cols="5")
+                    worksheet.append_row(["Timestamp", "Creator Name", "Total Assigned", "Assignments JSON", "Submission UUID"])
+                
+                worksheet.append_row([
+                    timestamp,
+                    clean_creator,
+                    total_assigned,
+                    json.dumps(clean_assignments, ensure_ascii=False),
+                    submission_uuid
+                ])
+                saved_online = True
+                logger.info(f"Successfully saved Kiniela prediction for '{clean_creator}' to Google Sheets!")
+            except Exception as e:
+                logger.warning(f"Failed to save to Google Sheets directly: {e}")
+
+        # Local persistence in data/kiniela_submissions.json with thread-safe atomic lock
+        with self._lock:
+            submissions = self._read_data("kiniela_submissions.json", [])
+            if not isinstance(submissions, list):
+                submissions = []
+            
+            max_id = 0
+            for s in submissions:
+                try:
+                    curr_id = int(s.get("id", 0))
+                    if curr_id > max_id:
+                        max_id = curr_id
+                except (ValueError, TypeError):
+                    pass
+            new_id = max_id + 1
+
+            new_entry = {
+                "id": new_id,
+                "uuid": submission_uuid,
+                "timestamp": timestamp,
+                "creator_name": clean_creator,
+                "total_assigned": total_assigned,
+                "assignments": clean_assignments,
+                "saved_online": saved_online,
+                "ip_hash": ip_hash,
+                "user_agent": sanitize_text(user_agent, max_length=150) if user_agent else None
+            }
+            submissions.append(new_entry)
+            self._write_data("kiniela_submissions.json", submissions)
+                
+        return {
+            "status": "success",
+            "message": f"Kiniela de {clean_creator} guardada correctament a la base de dades!",
+            "saved_online": saved_online,
+            "id": new_id,
+            "uuid": submission_uuid,
+            "total_assigned": total_assigned,
+            "timestamp": timestamp
+        }
+
+    def get_novetats(self):
+        """Fetch news and posts from JSON store (with fallback)."""
+        records = self._read_data("novetats.json", None)
+        if records and len(records) > 0:
+            return records
+        defaults = self._default_novetats()
+        self._write_data("novetats.json", defaults)
+        return defaults
+
+    def add_novetat(self, data):
+        """Add a new novetat to JSON database with complete input sanitization."""
+        items = self.get_novetats()
+        next_id = max([item.get('id', 0) for item in items], default=0) + 1
+        new_post = {
+            "id": next_id,
+            "title": sanitize_text(data.get('title', ''), max_length=200),
+            "date": sanitize_text(data.get('date', datetime.datetime.now().strftime("%d %b %Y")), max_length=50).upper(),
+            "tag": sanitize_text(data.get('tag', 'GENERAL'), max_length=50).upper(),
+            "author": sanitize_text(data.get('author', 'Equip de Caps'), max_length=100),
+            "excerpt": sanitize_text(data.get('excerpt', ''), max_length=500, allow_newlines=True),
+            "content": sanitize_text(data.get('content', ''), max_length=15000, allow_newlines=True),
+            "image": sanitize_url(data.get('image', '/static/images/scout_foulard.jpg')),
+            "read_time": sanitize_text(data.get('read_time', '3 min de lectura'), max_length=50)
+        }
+        items.insert(0, new_post)
+        self._write_data("novetats.json", items)
+        return new_post
+
+    def delete_novetat(self, post_id):
+        """Remove a novetat by id."""
+        items = self.get_novetats()
+        items = [x for x in items if str(x.get('id')) != str(post_id)]
+        self._write_data("novetats.json", items)
+        return True
+
+    def _default_novetats(self):
+        """Default seed news and posts for novetats.html"""
+        records = self._fetch_sheet_records("Novetats")
+        if records:
+            return records
+        
+        return [
+            {
+                "id": 1,
+                "title": "CIM AL K2: L'EXPEDICIÓ D'HIVERN DELS TRUCS",
+                "date": "15 AGOST 2026",
+                "tag": "EXPEDICIÓ",
+                "author": "Equip de Caps",
+                "excerpt": "28,000 PEUS. PENJATS DELS DITS. L'adrenalina pura dels nostres equips conquerint els pics més alts del Pirineu en la nova ruta d'hivern.",
+                "content": "Els nois i noies de la unitat de Trucs han completat amb èxit la travessa d'alta muntanya. Inspirats en l'esperit d'assalt als grans cims, l'activitat ha demostrat el valor del treball en equip, la superació personal i el respecte per la natura.",
+                "image": "/static/images/backgroundmountains.png",
+                "read_time": "4 min de lectura"
+            },
+            {
+                "id": 2,
+                "title": "INICI DEL CURS ESCOLTA 2026-2027 A GRÀCIA",
+                "date": "10 AGOST 2026",
+                "tag": "ANUNCI",
+                "author": "Cap de Agrupament",
+                "excerpt": "Obrim inscripcions per a totes les unitats! Des dels més petits Esquirols fins als Pioners i Trucs. Fem barri, fem escoltisme.",
+                "content": "Aquest setembre tornem a omplir la Plaça del Nord i el local dels Lluïsos de Gràcia. Prepareu els foulards i les motxilles per a un any ple d'excursions, cau i projectes comunitaris.",
+                "image": "/static/images/scout_foulard.jpg",
+                "read_time": "3 min de lectura"
+            },
+            {
+                "id": 3,
+                "title": "GRANDIOSA FIRA DEL MERCAU DE TARDOR",
+                "date": "02 AGOST 2026",
+                "tag": "MERCAU",
+                "author": "Comissió de Festes",
+                "excerpt": "Roba retro, material d'acampada vintage, samarretes de l'agrupament i parada de menjar casolà per finançar el projecte d'estiu.",
+                "content": "Us esperem a tots dissabte vinent. Tindrem música en directe, tallers d'amarratges i nusos escoltes, i paradetes amb productes exclusius del nostre Mercau.",
+                "image": "/static/images/scout_foulard.jpg",
+                "read_time": "5 min de lectura"
+            },
+            {
+                "id": 4,
+                "title": "TALLER D'ORIENTACIÓ I CARTOGRAFIA A COLLSEROLA",
+                "date": "25 JULIOL 2026",
+                "tag": "FORMACIÓ",
+                "author": "Muntanya & Natura",
+                "excerpt": "Com orientar-se amb mapa topogràfic i brúixola sense GPS. Una jornada pràctica per a Ràngers i Noies Guies.",
+                "content": "Saber llegir les corbes de nivell i interpretar el relleu és fonamental per a qualsevol escolta. La sortida pràctica de dissabte va ser un èxit total.",
+                "image": "/static/images/backgroundmountains.png",
+                "read_time": "2 min de lectura"
+            }
+        ]
+
+    def get_calendar_events(self):
+        """Fetch events from JSON store across the scout year."""
+        records = self._read_data("calendari.json", None)
+        if records and len(records) > 0:
+            excluded_cau_dates = {
+                "2026-10-03", "2026-12-26", "2027-01-02", "2027-01-09",
+                "2027-03-20", "2027-03-27", "2027-04-10", "2027-06-26"
+            }
+            records = [
+                event for event in records
+                if not (
+                    event.get('title') == 'Cau'
+                    and (
+                        event.get('date', '')[5:7] in {'07', '08', '09'}
+                        or event.get('date') in excluded_cau_dates
+                    )
+                )
+            ]
+            records = [
+                event for event in records
+                if not (
+                    (event.get('title') == 'Excursió' and event.get('date') == '2026-10-17')
+                    or (event.get('title') == 'Cau' and event.get('date') == '2026-11-14')
+                )
+            ]
+            for event in records:
+                if event.get('title') == 'Excursió' and not event.get('end_date'):
+                    start_date = datetime.date.fromisoformat(event['date'])
+                    event['end_date'] = (start_date + datetime.timedelta(days=1)).isoformat()
+                if event.get('title') == 'Excursió' and event.get('date') == '2027-07-10':
+                    event['date'] = '2027-05-08'
+                    event['end_date'] = '2027-05-09'
+                if event.get('title') == 'Campaments Primavera':
+                    event['end_date'] = '2027-03-23'
+                    event['time'] = 'Dissabte 08:00 - Dimarts 18:30'
+            existing_event_keys = {(event.get('title'), event.get('date')) for event in records}
+            next_id = max([event.get('id', 0) for event in records], default=100) + 1
+            for special_event in self._calendar_special_events():
+                event_key = (special_event['title'], special_event['date'])
+                if event_key not in existing_event_keys:
+                    special_event['id'] = next_id
+                    records.append(special_event)
+                    existing_event_keys.add(event_key)
+                    next_id += 1
+            records.sort(key=lambda x: str(x.get('date', '')))
+            self._write_data("calendari.json", records)
+            return records
+        defaults = self._default_calendar_events()
+        self._write_data("calendari.json", defaults)
+        return defaults
+
+    def add_calendar_event(self, data):
+        """Add a new calendar event with complete input sanitization."""
+        events = self.get_calendar_events()
+        next_id = max([e.get('id', 0) for e in events], default=100) + 1
+        new_event = {
+            "id": next_id,
+            "title": sanitize_text(data.get('title', ''), max_length=200),
+            "date": sanitize_text(data.get('date', ''), max_length=50),
+            "time": sanitize_text(data.get('time', '16:30 - 19:00'), max_length=50),
+            "location": sanitize_text(data.get('location', 'Local AE Lluïsos de Gràcia'), max_length=200),
+            "unit": sanitize_text(data.get('unit', 'Assemblea & General'), max_length=100),
+            "badge_color": sanitize_hex_color(data.get('badge_color', '#0B2545')),
+            "image": sanitize_url(data.get('image', '/static/images/scout_foulard.jpg')),
+            "description": sanitize_text(data.get('description', ''), max_length=5000, allow_newlines=True)
+        }
+        events.append(new_event)
+        events.sort(key=lambda x: str(x.get('date', '')))
+        self._write_data("calendari.json", events)
+        return new_event
+
+    def update_calendar_event(self, event_id, data):
+        """Update an existing calendar event by id with complete input sanitization."""
+        events = self.get_calendar_events()
+        for idx, event in enumerate(events):
+            if str(event.get('id')) == str(event_id):
+                if 'title' in data and data.get('title') is not None:
+                    event['title'] = sanitize_text(data['title'], max_length=200)
+                if 'date' in data and data.get('date') is not None:
+                    event['date'] = sanitize_text(data['date'], max_length=50)
+                if 'time' in data and data.get('time') is not None:
+                    event['time'] = sanitize_text(data['time'], max_length=50)
+                if 'location' in data and data.get('location') is not None:
+                    event['location'] = sanitize_text(data['location'], max_length=200)
+                if 'unit' in data and data.get('unit') is not None:
+                    event['unit'] = sanitize_text(data['unit'], max_length=100)
+                if 'badge_color' in data and data.get('badge_color') is not None:
+                    event['badge_color'] = sanitize_hex_color(data['badge_color'])
+                if 'image' in data and data.get('image'):
+                    event['image'] = sanitize_url(data['image'])
+                if 'description' in data and data.get('description') is not None:
+                    event['description'] = sanitize_text(data['description'], max_length=5000, allow_newlines=True)
+                events[idx] = event
+                events.sort(key=lambda x: str(x.get('date', '')))
+                self._write_data("calendari.json", events)
+                return event
+        return None
+
+    def delete_calendar_event(self, event_id):
+        """Remove a calendar event by id."""
+        events = self.get_calendar_events()
+        events = [x for x in events if str(x.get('id')) != str(event_id)]
+        self._write_data("calendari.json", events)
+        return True
+
+    def _calendar_special_events(self):
+        return [
+            {
+                "title": "Últim Cau",
+                "date": "2026-09-19",
+                "time": "16:30 - 19:00",
+                "location": "Local AE Lluïsos de Gràcia",
+                "unit": "Totes les unitats",
+                "badge_color": "#FF5722",
+                "image": "/static/images/scout_foulard.jpg",
+                "description": "Últim cau de la temporada."
+            },
+            {
+                "title": "Campaments Primavera",
+                "date": "2027-03-20",
+                "end_date": "2027-03-23",
+                "time": "Dissabte 08:00 - Dimarts 18:30",
+                "location": "Entorn natural de Catalunya",
+                "unit": "Totes les unitats",
+                "badge_color": "#16A34A",
+                "image": "/static/images/backgroundmountains.png",
+                "description": "Campaments de primavera de l'agrupament."
+            },
+            {
+                "title": "Jamborinada",
+                "date": "2027-04-10",
+                "end_date": "2027-04-11",
+                "time": "Dissabte 08:00 - Diumenge 18:30",
+                "location": "Entorn natural de Catalunya",
+                "unit": "Totes les unitats",
+                "badge_color": "#2563EB",
+                "image": "/static/images/backgroundmountains.png",
+                "description": "Sortida de cap de setmana a la Jamborinada."
+            },
+            {
+                "title": "Campaments Hivern (Pionel·les)",
+                "date": "2026-12-27",
+                "end_date": "2026-12-29",
+                "time": "Diumenge 08:00 - Dimarts 18:30",
+                "location": "Entorn natural de Catalunya",
+                "unit": "Pionel·les",
+                "badge_color": "#DC2626",
+                "image": "/static/images/backgroundmountains.png",
+                "description": "Campaments d'hivern de les Pionel·les."
+            },
+            {
+                "title": "Cau",
+                "date": "2026-10-17",
+                "time": "16:30 - 19:00",
+                "location": "Local AE Lluïsos de Gràcia",
+                "unit": "Totes les unitats",
+                "badge_color": "#FF5722",
+                "image": "/static/images/scout_foulard.jpg",
+                "description": "Activitat de cau de dissabte per a totes les unitats."
+            },
+            {
+                "title": "Excursió de Passos",
+                "date": "2026-10-03",
+                "end_date": "2026-10-04",
+                "time": "Dissabte 08:00 - Diumenge 18:30",
+                "location": "Entorn natural de Catalunya",
+                "unit": "Totes les unitats",
+                "badge_color": "#0284C7",
+                "image": "/static/images/backgroundmountains.png",
+                "description": "Excursió de passos de branca del cap de setmana."
+            },
+            {
+                "title": "Excursió",
+                "date": "2026-11-14",
+                "end_date": "2026-11-15",
+                "time": "Dissabte 08:00 - Diumenge 18:30",
+                "location": "Entorn natural de Catalunya",
+                "unit": "Totes les unitats",
+                "badge_color": "#0284C7",
+                "image": "/static/images/backgroundmountains.png",
+                "description": "Excursió de cap de setmana amb sortida dissabte al matí i tornada diumenge a la tarda."
+            }
+        ]
+
+    def _default_calendar_events(self):
+        """Fetch events for calendar.html and calendari.html across the 2026-2027 scout year"""
+        records = self._fetch_sheet_records("Calendari")
+        if records:
+            return records
+
+        excluded_cau_dates = {
+            datetime.date(2026, 10, 3),
+            datetime.date(2026, 12, 26),
+            datetime.date(2027, 1, 2),
+            datetime.date(2027, 1, 9),
+            datetime.date(2027, 3, 20),
+            datetime.date(2027, 3, 27),
+            datetime.date(2027, 4, 10),
+            datetime.date(2027, 6, 26),
+            datetime.date(2027, 5, 8),
+        }
+        events = []
+        current_date = datetime.date(2026, 9, 12)
+        final_date = datetime.date(2027, 9, 18)
+        event_id = 101
+
+        while current_date <= final_date:
+            if current_date.month not in {7, 8, 9} and current_date not in excluded_cau_dates:
+                events.append({
+                    "id": event_id,
+                    "title": "Cau",
+                    "date": current_date.isoformat(),
+                    "time": "16:30 - 19:00",
+                    "location": "Local AE Lluïsos de Gràcia",
+                    "unit": "Totes les unitats",
+                    "badge_color": "#FF5722",
+                    "image": "/static/images/scout_foulard.jpg",
+                    "description": "Activitat de cau de dissabte per a totes les unitats."
+                })
+                event_id += 1
+
+            if current_date in {
+                datetime.date(2026, 11, 14),
+                datetime.date(2026, 12, 5),
+                datetime.date(2027, 2, 20),
+                datetime.date(2027, 4, 24),
+                datetime.date(2027, 5, 8),
+            }:
+                events.append({
+                    "id": event_id,
+                    "title": "Excursió",
+                    "date": current_date.isoformat(),
+                    "end_date": (current_date + datetime.timedelta(days=1)).isoformat(),
+                    "time": "Dissabte 08:00 - Diumenge 18:30",
+                    "location": "Entorn natural de Catalunya",
+                    "unit": "Totes les unitats",
+                    "badge_color": "#0284C7",
+                    "image": "/static/images/backgroundmountains.png",
+                    "description": "Excursió de cap de setmana amb sortida dissabte al matí i tornada diumenge a la tarda."
+                })
+                event_id += 1
+
+            current_date += datetime.timedelta(days=7)
+
+        for special_event in self._calendar_special_events():
+            special_event['id'] = event_id
+            events.append(special_event)
+            event_id += 1
+
+        return events
+        
+        return [
+            # --- SETEMBRE 2026 ---
+            {
+                "id": 101,
+                "title": "Passos d'Unitat i Cau de Benvinguda",
+                "date": "2026-09-12",
+                "time": "16:00 - 19:30",
+                "location": "Plaça del Nord, Gràcia",
+                "unit": "Assemblea & General",
+                "badge_color": "#0B2545",
+                "image": "/static/images/scout_foulard.jpg",
+                "description": "Inici oficial del curs 2026-2027. Jocs de retrobament, presentació dels equips de caps i cerimònia de passos de branca a la plaça."
+            },
+            {
+                "id": 102,
+                "title": "Primer Cau de Branca i Dinàmica de Colla",
+                "date": "2026-09-19",
+                "time": "16:30 - 19:00",
+                "location": "Local Lluïsos de Gràcia",
+                "unit": "Castúdrigues",
+                "badge_color": "#F97316",
+                "image": "/static/images/backgroundmountains.png",
+                "description": "Coneixença dels nous castors i llúdrigues, creació de les sisenes i descoberta del cau secret."
+            },
+            {
+                "id": 103,
+                "title": "Excursió de Bivac al Montseny",
+                "date": "2026-09-26",
+                "time": "Dissabte 08:00 - Diumenge 18:00",
+                "location": "Sant Celoni - Turó de l'Home",
+                "unit": "Ranguis",
+                "badge_color": "#0284C7",
+                "image": "/static/images/backgroundmountains.png",
+                "description": "Primera sortida amb nit sota les estrelles del curs. Ruta de muntanya de 14km i taller d'orientació amb brúixola."
+            },
+            {
+                "id": 104,
+                "title": "Trobada de Responsables de Sector MEG",
+                "date": "2026-09-27",
+                "time": "10:00 - 14:00",
+                "location": "Seu Central MEG (Barcelona)",
+                "unit": "MEG",
+                "badge_color": "#7C3AED",
+                "image": "/static/images/scout_foulard.jpg",
+                "description": "Coordinació pedagògica de la Demarcació del Barcelonès i planificació dels projectes de sector per al curs."
+            },
+
+            # --- OCTUBRE 2026 ---
+            {
+                "id": 105,
+                "title": "Assemblea General d'Agrupament (AGA)",
+                "date": "2026-10-03",
+                "time": "18:30 - 21:00",
+                "location": "Local AE Lluïsos de Gràcia",
+                "unit": "Assemblea & General",
+                "badge_color": "#0B2545",
+                "image": "/static/images/scout_foulard.jpg",
+                "description": "Aprovació del projecte educatiu de curs, memòria econòmica, renovació de càrrecs i trobada de famílies."
+            },
+            {
+                "id": 106,
+                "title": "Gran Cacera de Tardor dels Llops",
+                "date": "2026-10-10",
+                "time": "10:00 - 18:30",
+                "location": "Parc de Collserola (Can Masdeu)",
+                "unit": "Dainops",
+                "badge_color": "#F59E0B",
+                "image": "/static/images/backgroundmountains.png",
+                "description": "Joc de pistes a la natura basat en el Llibre de la Selva, rastreig de petjades i dinar de carmanyola."
+            },
+            {
+                "id": 107,
+                "title": "Fira d'Agrupament i Castanyada Popular",
+                "date": "2026-10-24",
+                "time": "10:00 - 20:00",
+                "location": "Plaça de la Revolució, Gràcia",
+                "unit": "Assemblea & General",
+                "badge_color": "#0B2545",
+                "image": "/static/images/scout_foulard.jpg",
+                "description": "Parades d'artesania, mercadet vintage, tast de castanyes i moniatos, i actuació musical de l'agrupament."
+            },
+            {
+                "id": 108,
+                "title": "Ruta de Descobriment i Servei Truk",
+                "date": "2026-10-31",
+                "time": "08:00 - 20:00",
+                "location": "Serra de Marina (Badalona)",
+                "unit": "Truk",
+                "badge_color": "#059669",
+                "image": "/static/images/backgroundmountains.png",
+                "description": "Projecte comunitari de recuperació de camins forestals i debat sobre sobirania alimentària."
+            },
+
+            # --- NOVEMBRE 2026 ---
+            {
+                "id": 109,
+                "title": "Raid de Supervivència i Pionerisme",
+                "date": "2026-11-07",
+                "time": "Dissabte 08:30 - Diumenge 17:00",
+                "location": "Parc Natural de Sant Llorenç del Munt",
+                "unit": "Pionel·les",
+                "badge_color": "#E11D48",
+                "image": "/static/images/backgroundmountains.png",
+                "description": "Construccions de fusta amb amarratges i nusos, cuina d'acampada i ascensió a la Mola."
+            },
+            {
+                "id": 110,
+                "title": "Taller d'Ecologia i Horta Urbana",
+                "date": "2026-11-14",
+                "time": "16:00 - 19:00",
+                "location": "Hort Comunitari de Gràcia",
+                "unit": "Castúdrigues",
+                "badge_color": "#F97316",
+                "image": "/static/images/scout_foulard.jpg",
+                "description": "Descobrim la biodiversitat de l'hort, plantem llavors d'hivern i fem menjadores per a ocells."
+            },
+            {
+                "id": 111,
+                "title": "Consell de Roca i Consell d'Honor",
+                "date": "2026-11-21",
+                "time": "16:30 - 19:30",
+                "location": "Local Lluïsos de Gràcia",
+                "unit": "Dainops",
+                "badge_color": "#F59E0B",
+                "image": "/static/images/scout_foulard.jpg",
+                "description": "Avaluació del primer trimestre i compromís dels llobatons amb la Llei de la Selva."
+            },
+            {
+                "id": 112,
+                "title": "Jornada de Formació MEG per a Caps",
+                "date": "2026-11-28",
+                "time": "09:30 - 18:00",
+                "location": "Casal de Joves Can Ricart (Poblenou)",
+                "unit": "MEG",
+                "badge_color": "#7C3AED",
+                "image": "/static/images/scout_foulard.jpg",
+                "description": "Formació en primers auxilis en muntanya, gestió emocional i coeducació per als equips de caps de Catalunya."
+            },
+
+            # --- DESEMBRE 2026 ---
+            {
+                "id": 113,
+                "title": "Llum de la Pau de Betlem (MEG)",
+                "date": "2026-12-12",
+                "time": "17:00 - 20:30",
+                "location": "Basílica de Santa Maria del Mar",
+                "unit": "MEG",
+                "badge_color": "#7C3AED",
+                "image": "/static/images/scout_foulard.jpg",
+                "description": "Acte central de rebuda de la Llum de la Pau i distribució pels barris i agrupaments escoltes."
+            },
+            {
+                "id": 114,
+                "title": "Campament d'Hivern d'Agrupament",
+                "date": "2026-12-27",
+                "time": "27 Desembre - 30 Desembre",
+                "location": "Casa de Colònies La Traüna (Montseny)",
+                "unit": "Assemblea & General",
+                "badge_color": "#0B2545",
+                "image": "/static/images/backgroundmountains.png",
+                "description": "4 dies de convivència de totes les branques, focs de camp, vetllades d'hivern i tallers artesanals."
+            },
+
+            # --- GENER 2027 ---
+            {
+                "id": 115,
+                "title": "Cau de Reis i Jocs de Taula Gegants",
+                "date": "2027-01-09",
+                "time": "16:00 - 19:30",
+                "location": "Plaça del Nord, Gràcia",
+                "unit": "Castúdrigues",
+                "badge_color": "#F97316",
+                "image": "/static/images/scout_foulard.jpg",
+                "description": "Retrobament després de festes, jocs tradicionals cooperatius i berenar amb xocolatada."
+            },
+            {
+                "id": 116,
+                "title": "Travessa de Neu i Raquetes",
+                "date": "2027-01-23",
+                "time": "Dissabte 06:30 - Diumenge 19:00",
+                "location": "Vall de Núria - Puigmal",
+                "unit": "Truk",
+                "badge_color": "#059669",
+                "image": "/static/images/backgroundmountains.png",
+                "description": "Itinerari d'alta muntanya amb raquetes de neu, bivac hivernal i formació en seguretat davant allaus."
+            },
+
+            # --- FEBRER 2027 ---
+            {
+                "id": 117,
+                "title": "Gran Calçotada Escoltes de Gràcia",
+                "date": "2027-02-06",
+                "time": "11:00 - 18:00",
+                "location": "Masia Can Soler (Collserola)",
+                "unit": "Assemblea & General",
+                "badge_color": "#0B2545",
+                "image": "/static/images/scout_foulard.jpg",
+                "description": "Trobada festiva per a famílies, antics escoltes, caps i infants amb foc de llenya i dinar comunitari."
+            },
+            {
+                "id": 118,
+                "title": "Dia del Pensament Escolta (Thinking Day - MEG)",
+                "date": "2027-02-20",
+                "time": "10:00 - 18:00",
+                "location": "Parc de la Ciutadella",
+                "unit": "MEG",
+                "badge_color": "#7C3AED",
+                "image": "/static/images/scout_foulard.jpg",
+                "description": "Commemoració mundial del naixement de Baden-Powell amb més de 2.000 escoltes d'arreu de Catalunya."
+            },
+            {
+                "id": 119,
+                "title": "Campionat d'Orientació i Rastreig",
+                "date": "2027-02-27",
+                "time": "09:00 - 16:30",
+                "location": "Parc del Laberint d'Horta",
+                "unit": "Ranguis",
+                "badge_color": "#0284C7",
+                "image": "/static/images/backgroundmountains.png",
+                "description": "Cursa d'orientació amb balises cronometrades i reptes de lògica per patrulles."
+            },
+
+            # --- MARÇ 2027 ---
+            {
+                "id": 120,
+                "title": "Projecte Comunitari: Neteja del Litoral",
+                "date": "2027-03-13",
+                "time": "09:30 - 15:00",
+                "location": "Platja de la Mar Bella",
+                "unit": "Pionel·les",
+                "badge_color": "#E11D48",
+                "image": "/static/images/scout_foulard.jpg",
+                "description": "Acció de voluntariat ambiental per recollir microplàstics i sensibilitzar sobre l'impacte marí."
+            },
+            {
+                "id": 121,
+                "title": "Excursió de Primavera al Pedraforca",
+                "date": "2027-03-27",
+                "time": "Dissabte 07:00 - Diumenge 18:00",
+                "location": "Gósol - Refugi Lluís Estasen",
+                "unit": "Truk",
+                "badge_color": "#059669",
+                "image": "/static/images/backgroundmountains.png",
+                "description": "Ruta clàssica als contraforts del Pedraforca, observació de fauna pirinenca i nit al refugi."
+            },
+
+            # --- ABRIL 2027 ---
+            {
+                "id": 122,
+                "title": "Campament de Pasqua per Branques",
+                "date": "2027-04-10",
+                "time": "10 Abril - 12 Abril",
+                "location": "Ripollès / Garrotxa",
+                "unit": "Assemblea & General",
+                "badge_color": "#0B2545",
+                "image": "/static/images/backgroundmountains.png",
+                "description": "Sortides simultànies de cap de setmana llarg per a totes les unitats en terreny de muntanya."
+            },
+            {
+                "id": 123,
+                "title": "Diada de Sant Jordi a la Plaça del Nord",
+                "date": "2027-04-23",
+                "time": "09:00 - 20:30",
+                "location": "Plaça del Nord, Gràcia",
+                "unit": "Assemblea & General",
+                "badge_color": "#0B2545",
+                "image": "/static/images/scout_foulard.jpg",
+                "description": "Parada oficial de roses, llibres escoltes de segona mà, punt de lectura infantil i cançons de bressol."
+            },
+
+            # --- MAIG 2027 ---
+            {
+                "id": 124,
+                "title": "Gran Bivac d'Unitat sota el Cel de Montserrat",
+                "date": "2027-05-08",
+                "time": "Dissabte 08:00 - Diumenge 17:00",
+                "location": "Monestir de Montserrat - Sant Jeroni",
+                "unit": "Ranguis",
+                "badge_color": "#0284C7",
+                "image": "/static/images/backgroundmountains.png",
+                "description": "Pujada per les escales dels Pobres, nit al cim de Sant Jeroni i observació d'estels amb telescopi."
+            },
+            {
+                "id": 125,
+                "title": "Assemblea de Primavera MEG del Barcelonès",
+                "date": "2027-05-15",
+                "time": "10:00 - 17:00",
+                "location": "Ateneu de Gràcia",
+                "unit": "MEG",
+                "badge_color": "#7C3AED",
+                "image": "/static/images/scout_foulard.jpg",
+                "description": "Balanç dels projectes de la demarcació i aprovació de les línies de campaments d'estiu."
+            },
+            {
+                "id": 126,
+                "title": "Olimpíades Escoltes Inter-Agrupaments",
+                "date": "2027-05-29",
+                "time": "10:00 - 18:30",
+                "location": "Pista Poliesportiva del Guinardó",
+                "unit": "Dainops",
+                "badge_color": "#F59E0B",
+                "image": "/static/images/scout_foulard.jpg",
+                "description": "Jocs esportius, curses de sacs, estirar la corda i relleus cooperatius amb agrupaments veïns."
+            },
+
+            # --- JUNY 2027 ---
+            {
+                "id": 127,
+                "title": "Assemblea de Pares i Presentació de Campaments",
+                "date": "2027-06-05",
+                "time": "18:00 - 20:30",
+                "location": "Local Lluïsos de Gràcia",
+                "unit": "Assemblea & General",
+                "badge_color": "#0B2545",
+                "image": "/static/images/scout_foulard.jpg",
+                "description": "Reunió informativa clau sobre la logística, material i fitxes mèdiques dels campaments d'estiu 2027."
+            },
+            {
+                "id": 128,
+                "title": "Festa de Cloenda del Curs i Sopar de Carmanyola",
+                "date": "2027-06-19",
+                "time": "17:00 - 23:00",
+                "location": "Plaça del Nord, Gràcia",
+                "unit": "Assemblea & General",
+                "badge_color": "#0B2545",
+                "image": "/static/images/scout_foulard.jpg",
+                "description": "Vídeo resum de curs, actuacions de les unitats, lliurament d'insígnies i concert acústic de caps."
+            },
+
+            # --- JULIOL 2027 ---
+            {
+                "id": 129,
+                "title": "Campament d'Estiu: Pirineus 2027",
+                "date": "2027-07-10",
+                "time": "10 Juliol - 24 Juliol",
+                "location": "Vall de Cardós (Pallars Sobirà)",
+                "unit": "Assemblea & General",
+                "badge_color": "#0B2545",
+                "image": "/static/images/backgroundmountains.png",
+                "description": "El gran esdeveniment de l'any! 15 dies de tendes, cuina de campament, rutes de muntanya i banys de riu."
+            },
+            {
+                "id": 130,
+                "title": "Expedició Internacional Pionel·les & Truk",
+                "date": "2027-07-26",
+                "time": "26 Juliol - 08 Agost",
+                "location": "Kandersteg International Scout Centre (Suïssa)",
+                "unit": "Pionel·les",
+                "badge_color": "#E11D48",
+                "image": "/static/images/backgroundmountains.png",
+                "description": "Experiència internacional al centre scout mundial dels Alps suïssos amb joves de més de 50 països."
+            },
+
+            # --- AGOST 2027 ---
+            {
+                "id": 131,
+                "title": "Travessa d'Alta Ruta Truk al Mont Blanc",
+                "date": "2027-08-10",
+                "time": "10 Agost - 18 Agost",
+                "location": "Massís del Mont Blanc (Chamonix)",
+                "unit": "Truk",
+                "badge_color": "#059669",
+                "image": "/static/images/backgroundmountains.png",
+                "description": "Ruta circular alpina d'alta exigència per als nois i noies de la unitat gran de l'agrupament."
+            },
+            {
+                "id": 132,
+                "title": "Reunió de Coordinació Pedagògica MEG Estiu",
+                "date": "2027-08-28",
+                "time": "11:00 - 15:00",
+                "location": "Seu Central MEG (Barcelona)",
+                "unit": "MEG",
+                "badge_color": "#7C3AED",
+                "image": "/static/images/scout_foulard.jpg",
+                "description": "Avaluació dels campaments d'estiu i preparació de la campanya d'inscripcions 2027-2028."
+            },
+
+            # --- SETEMBRE 2027 ---
+            {
+                "id": 133,
+                "title": "Consell de Caps d'Inici de Curs 2027-2028",
+                "date": "2027-09-04",
+                "time": "09:30 - 18:00",
+                "location": "Local Lluïsos de Gràcia",
+                "unit": "Assemblea & General",
+                "badge_color": "#0B2545",
+                "image": "/static/images/scout_foulard.jpg",
+                "description": "Planificació estratègica de l'equip de caps per al nou curs i assignació de responsabilitats."
+            },
+            {
+                "id": 134,
+                "title": "Passos de Branca i Obertura Curs 2027-2028",
+                "date": "2027-09-18",
+                "time": "16:00 - 19:30",
+                "location": "Plaça del Nord, Gràcia",
+                "unit": "Assemblea & General",
+                "badge_color": "#0B2545",
+                "image": "/static/images/scout_foulard.jpg",
+                "description": "Benvinguda al curs 2027-2028, cerimònia dels passos d'unitat i retrobament de tota la comunitat escolta."
+            }
+        ]
+
+    def _normalize_cap_name(self, name):
+        """Normalize cap name into lowercase alphanumeric characters without accents."""
+        if not name:
+            return ""
+        nfkd = unicodedata.normalize('NFKD', str(name))
+        ascii_text = nfkd.encode('ASCII', 'ignore').decode('utf-8')
+        return re.sub(r'[^a-zA-Z0-9]', '', ascii_text).lower()
+
+    def _resolve_cap_image(self, name, current_image=None):
+        """Resolve cap image link by matching name against files in static/images/caps/.
+        If name not found or file does not exist, places /static/images/caps/deafult.png.
+        """
+        caps_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static", "images", "caps")
+        default_img = "/static/images/caps/deafult.png"
+
+        norm_name = self._normalize_cap_name(name)
+        if not norm_name:
+            return default_img
+
+        # 1. Match against files in static/images/caps/ by normalized filename
+        if os.path.isdir(caps_dir):
+            try:
+                for fname in os.listdir(caps_dir):
+                    f_base, f_ext = os.path.splitext(fname)
+                    # Skip default fallback during name matching
+                    if f_base.lower() in ("deafult", "default"):
+                        continue
+                    if self._normalize_cap_name(f_base) == norm_name:
+                        return f"/static/images/caps/{fname}"
+            except Exception as e:
+                logger.warning(f"Error scanning caps directory: {e}")
+
+        # 2. Check if current_image is a valid custom local path or URL (and not a dicebear avatar placeholder)
+        if current_image and isinstance(current_image, str):
+            curr = current_image.strip()
+            if curr and not curr.startswith("https://api.dicebear.com") and not curr.startswith("http://api.dicebear.com"):
+                if curr.startswith("/static/"):
+                    local_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), curr.lstrip("/"))
+                    if os.path.exists(local_path):
+                        return curr
+                elif curr.startswith("http://") or curr.startswith("https://"):
+                    return curr
+
+        # 3. Fallback to default image
+        return default_img
+
+    def _enrich_cap_data(self, cap):
+        """Ensure cap has proper image link, matching by name with fallback to deafult.png"""
+        c = dict(cap)
+        c["image"] = self._resolve_cap_image(c.get("name", ""), c.get("image"))
+        return c
+
+    def _default_caps(self):
+        return [
+            {
+                "id": 1,
+                "name": "Joana Solà",
+                "role": "Cap de Branca",
+                "unit": "Castúdrigues",
+                "unit_code": "castors",
+                "years": "3 anys a l'agrupament",
+                "bio": "Creu que la millor manera d'aprendre és riure, jugar i fer petits grans projectes amb la gent del cau.",
+                "image": "/static/images/caps/deafult.png",
+                "quote": "\"Cada aventura comença amb un gran somriure.\""
+            },
+            {
+                "id": 2,
+                "name": "Maia de Cock",
+                "role": "Cap de Branca",
+                "unit": "Castúdrigues",
+                "unit_code": "castors",
+                "years": "2 anys a l'agrupament",
+                "bio": "Entusiasta de la natura i dels jocs d'orientació. Vol ajudar cada infant a trobar el seu ritme i confiança.",
+                "image": "/static/images/caps/deafult.png",
+                "quote": "\"Que cada passejada ens ajudi a créixer.\""
+            },
+            {
+                "id": 3,
+                "name": "Guillem Rodon",
+                "role": "Cap de Branca",
+                "unit": "Castúdrigues",
+                "unit_code": "castors",
+                "years": "4 anys a l'agrupament",
+                "bio": "Apassionat de les rutes, la convivència i els projectes col·lectius que fan créixer l'equip.",
+                "image": "/static/images/caps/deafult.png",
+                "quote": "\"El bon camí es fa amb companys.\""
+            },
+            {
+                "id": 4,
+                "name": "Bernat Escolà",
+                "role": "Cap de Branca",
+                "unit": "Castúdrigues",
+                "unit_code": "castors",
+                "years": "5 anys a l'agrupament",
+                "bio": "Lidera projectes de muntanya i de grup amb molta cura, previsió i energia positiva.",
+                "image": "/static/images/caps/bernatescola.png",
+                "quote": "\"Cada repte és una oportunitat per aprendre.\""
+            },
+            {
+                "id": 5,
+                "name": "Sol Font",
+                "role": "Cap de Branca",
+                "unit": "Dainops",
+                "unit_code": "llops",
+                "years": "6 anys a l'agrupament",
+                "bio": "Treballa per donar espai a la iniciativa dels joves i promoure la responsabilitat compartida.",
+                "image": "/static/images/caps/deafult.png",
+                "quote": "\"L'autonomia es construeix amb confiança.\""
+            },
+            {
+                "id": 6,
+                "name": "Clara Torres",
+                "role": "Cap de Branca",
+                "unit": "Dainops",
+                "unit_code": "llops",
+                "years": "4 anys a l'agrupament",
+                "bio": "Especialista en dinamització de grup, lideratge i crear espais on tots es sentin part del projecte.",
+                "image": "/static/images/caps/deafult.png",
+                "quote": "\"La millor pinya s'aconsegueix escoltant-s'hi.\""
+            },
+            {
+                "id": 7,
+                "name": "Èlia Coll",
+                "role": "Cap de Branca",
+                "unit": "Dainops",
+                "unit_code": "llops",
+                "years": "3 anys a l'agrupament",
+                "bio": "Té l'hàbit de convertir cada joc en una experiència d'aprenentatge, companyonia i respecte.",
+                "image": "/static/images/caps/deafult.png",
+                "quote": "\"La natura ens ensenya a compartir.\""
+            },
+            {
+                "id": 8,
+                "name": "Maür Roda",
+                "role": "Cap de Branca",
+                "unit": "Dainops",
+                "unit_code": "llops",
+                "years": "2 anys a l'agrupament",
+                "bio": "Va descobrir que els petits detalls també són grans aventures i que la curiositat és la millor eina.",
+                "image": "/static/images/caps/maurroda.png",
+                "quote": "\"Petits passos, grans descobertes.\""
+            },
+            {
+                "id": 9,
+                "name": "Dani Casadevall",
+                "role": "Cap de Branca",
+                "unit": "Ranguis",
+                "unit_code": "ranguis",
+                "years": "4 anys a l'agrupament",
+                "bio": "Implicat en activitats de muntanya i en construir una dinàmica de grup segura i divertida.",
+                "image": "/static/images/caps/deafult.png",
+                "quote": "\"La millor aventura es comparteix.\""
+            },
+            {
+                "id": 10,
+                "name": "Helena Herranz",
+                "role": "Coordinació",
+                "unit": "Ranguis",
+                "unit_code": "ranguis",
+                "years": "6 anys a l'agrupament",
+                "bio": "Coordina els equips amb una mirada pedagògica i alhora molt pràctica, sempre amb voluntat de cuidar l'agrupament.",
+                "image": "/static/images/caps/helenaherranz.png",
+                "quote": "\"L'organització és el motor de la creativitat.\""
+            },
+            {
+                "id": 11,
+                "name": "Iu Sales",
+                "role": "Cap de Branca",
+                "unit": "Ranguis",
+                "unit_code": "ranguis",
+                "years": "5 anys a l'agrupament",
+                "bio": "Aplica el pensament crític i l'autonomia a cada projecte per ajudar el grup a créixer amb criteri.",
+                "image": "/static/images/caps/deafult.png",
+                "quote": "\"Quan hi ha confiança, hi ha aventura.\""
+            },
+            {
+                "id": 12,
+                "name": "Nil Mitjavila",
+                "role": "Cap de Branca",
+                "unit": "Pionel·les",
+                "unit_code": "pios",
+                "years": "3 anys a l'agrupament",
+                "bio": "Acosta els nens i nenes al món de l'escoltisme amb creativitat, calma i mucha energia positiva.",
+                "image": "/static/images/caps/deafult.png",
+                "quote": "\"Els petits detalls fan grans records.\""
+            },
+            {
+                "id": 13,
+                "name": "Aina Salinas",
+                "role": "Cap de Branca",
+                "unit": "Pionel·les",
+                "unit_code": "pios",
+                "years": "5 anys a l'agrupament",
+                "bio": "Mou el grup amb mirada servicial, idees clares i molt de compromís amb les persones i la comunitat.",
+                "image": "/static/images/caps/deafult.png",
+                "quote": "\"Serveix i aprèn amb el grup.\""
+            },
+            {
+                "id": 14,
+                "name": "Neus Lloses",
+                "role": "Coordinació",
+                "unit": "Pionel·les",
+                "unit_code": "pios",
+                "years": "7 anys a l'agrupament",
+                "bio": "Aporta calma, rigor i visió de conjunt per acompanyar els caps i fer créixer el projecte educatiu.",
+                "image": "/static/images/caps/deafult.png",
+                "quote": "\"La comunitat és la nostra gran aventura.\""
+            },
+            {
+                "id": 15,
+                "name": "Joan Roig",
+                "role": "Cap de Branca",
+                "unit": "Pionel·les",
+                "unit_code": "pios",
+                "years": "4 anys a l'agrupament",
+                "bio": "Motiva els joves amb il·lusió per la muntanya, la feina en equip i l'exploració responsable.",
+                "image": "/static/images/caps/joanroig.png",
+                "quote": "\"Cada viatge ens fa més grans.\""
+            },
+            {
+                "id": 16,
+                "name": "Pol Mer",
+                "role": "Cap de Branca",
+                "unit": "Pionel·les",
+                "unit_code": "pios",
+                "years": "4 anys a l'agrupament",
+                "bio": "Aporta energia, rigor i curiositat per ajudar els joves a organitzar projectes amb propòsit.",
+                "image": "/static/images/caps/deafult.png",
+                "quote": "\"Amb voluntat, cap projecte és massa gran.\""
+            },
+            {
+                "id": 17,
+                "name": "Arnau Escolà",
+                "role": "Cap de Branca",
+                "unit": "Truk",
+                "unit_code": "truk",
+                "years": "3 anys a l'agrupament",
+                "bio": "Parla amb naturalitat i seguretat, i sap connectar amb cada infant per crear un ambient de confiança.",
+                "image": "/static/images/caps/deafult.png",
+                "quote": "\"La confiança és la base de tot.\""
+            },
+            {
+                "id": 18,
+                "name": "Ivet Roig",
+                "role": "Cap de Branca",
+                "unit": "Truk",
+                "unit_code": "truk",
+                "years": "2 anys a l'agrupament",
+                "bio": "Especialista en crear espais on cada nen i nena pot jugar, explorar i sentir-se acollit.",
+                "image": "/static/images/caps/ivetroig.png",
+                "quote": "\"La creativitat obre moltes portes.\""
+            },
+            {
+                "id": 19,
+                "name": "Júlia Franquesa",
+                "role": "Coordinació",
+                "unit": "Truk",
+                "unit_code": "truk",
+                "years": "6 anys a l'agrupament",
+                "bio": "Dona forma a les activitats i projectes amb mirada pedagògica, compromís i molta energia.",
+                "image": "/static/images/caps/deafult.png",
+                "quote": "\"La millor educació és la que fa estimar.\""
+            },
+            {
+                "id": 20,
+                "name": "Lluc Roda",
+                "role": "Cap de Branca",
+                "unit": "Truk",
+                "unit_code": "truk",
+                "years": "5 anys a l'agrupament",
+                "bio": "Acompanya els joves en la seva autonomia, fent que cada decisió es converteixi en aprenentatge.",
+                "image": "/static/images/caps/deafult.png",
+                "quote": "\"Un bon equip és la millor eina de transformació.\""
+            },
+            {
+                "id": 21,
+                "name": "Simone García",
+                "role": "Cap de Branca",
+                "unit": "Truk",
+                "unit_code": "truk",
+                "years": "3 anys a l'agrupament",
+                "bio": "Busca provocar reflexió, diversió i compromís a través de projectes amb valor i sentit.",
+                "image": "/static/images/caps/deafult.png",
+                "quote": "\"La millor manera d'aprendre és fent.\""
+            }
+        ]
+
+    def get_caps(self):
+        """Fetch team members for caps.html and equips.html, resolving images by name or default fallback."""
+        records = self._fetch_sheet_records("Caps")
+        if not records:
+            records = self._read_data("caps.json", None)
+            if not records:
+                records = self._default_caps()
+                self._write_data("caps.json", records)
+
+        return [self._enrich_cap_data(cap) for cap in records]
+
+    def get_foulard_pins(self):
+        """Fetch map pinpoints from JSON store."""
+        records = self._read_data("foulard.json", None)
+        if records and len(records) > 0:
+            return records
+        defaults = self._default_foulard_pins()
+        self._write_data("foulard.json", defaults)
+        return defaults
+
+    def add_foulard_pin(self, data):
+        """Add a new foulard destination pin with complete input sanitization."""
+        pins = self.get_foulard_pins()
+        next_id = max([p.get('id', 0) for p in pins], default=0) + 1
+        lat = sanitize_float(data.get('lat', 41.4048), default=41.4048, min_val=-90.0, max_val=90.0)
+        lng = sanitize_float(data.get('lng', 2.1554), default=2.1554, min_val=-180.0, max_val=180.0)
+
+        new_pin = {
+            "id": next_id,
+            "title": sanitize_text(data.get('title', ''), max_length=200),
+            "location": sanitize_text(data.get('location', ''), max_length=200),
+            "country": sanitize_text(data.get('country', ''), max_length=100),
+            "lat": lat,
+            "lng": lng,
+            "year": sanitize_text(str(data.get('year', datetime.datetime.now().year)), max_length=20),
+            "unit": sanitize_text(data.get('unit', 'General'), max_length=100),
+            "description": sanitize_text(data.get('description', ''), max_length=5000, allow_newlines=True),
+            "type": sanitize_text(data.get('type', 'expedition'), max_length=50)
+        }
+        pins.append(new_pin)
+        self._write_data("foulard.json", pins)
+        return new_pin
+
+    def delete_foulard_pin(self, pin_id):
+        """Remove a foulard pin by id."""
+        pins = self.get_foulard_pins()
+        pins = [p for p in pins if str(p.get('id')) != str(pin_id)]
+        self._write_data("foulard.json", pins)
+        return True
+
+    def _default_foulard_pins(self):
+        """Fetch map pinpoints for foulard.html"""
+        records = self._fetch_sheet_records("FoulardMap")
+        if records:
+            return records
+        
+        return [
+            {
+                "id": 1,
+                "title": "Expedició Karakoram Trail",
+                "location": "K2 Base Camp, Baltoro Glacier",
+                "country": "Pakistan / Himàlaia",
+                "lat": 35.8808,
+                "lng": 76.5158,
+                "year": "2025",
+                "unit": "Trucs",
+                "description": "Expedició internacional dels Trucs per donar suport a projectes educatius de muntanya.",
+                "type": "expedition"
+            },
+            {
+                "id": 2,
+                "title": "Local Social AE Lluïsos de Gràcia",
+                "location": "Plaça del Nord, Gràcia (Barcelona)",
+                "country": "Catalunya",
+                "lat": 41.4048,
+                "lng": 2.1554,
+                "year": "Des de 1957",
+                "unit": "Seu Central",
+                "description": "El cor de l'agrupament. Punt de trobada de cada dissabte de cau.",
+                "type": "headquarters"
+            }
+        ]
+
+    def get_foulard_expeditions(self):
+        """Return example expeditions displayed below the Foulard map."""
+        expeditions = [
+            {
+                "id": 1,
+                "title": "Travessa dels Pirineus",
+                "author": "Aina Franquesa",
+                "image": "/static/images/backgroundmountains.png",
+                "location": "Vall de Núria, Catalunya",
+                "lat": 42.3981,
+                "lng": 2.1547,
+                "year": "2025",
+                "date": "12 de Juliol de 2025",
+                "description": "Una travessa entre refugis per descobrir els camins d'alta muntanya i cuidar el territori."
+            },
+            {
+                "id": 2,
+                "title": "Camí de Sant Jaume",
+                "author": "Marc Vila",
+                "image": "/static/images/mountains_cutout.png",
+                "location": "Galícia, Estat espanyol",
+                "lat": 42.8805,
+                "lng": -8.5442,
+                "year": "2024",
+                "date": "18 d'Agost de 2024",
+                "description": "Etapes compartides, converses llargues i una arribada a Santiago construïda entre tots."
+            },
+            {
+                "id": 3,
+                "title": "Volta al Mont Blanc",
+                "author": "Laia Domènech",
+                "image": "/static/images/skyline.jpg",
+                "location": "Chamonix, França",
+                "lat": 45.9237,
+                "lng": 6.8694,
+                "year": "2025",
+                "date": "6 de Setembre de 2025",
+                "description": "Una ruta alpina circular per aprendre a moure'ns amb respecte en un entorn exigent."
+            },
+            {
+                "id": 4,
+                "title": "Balcans en Bicicleta",
+                "author": "Guillem Pujol",
+                "image": "/static/images/scout_foulard.jpg",
+                "location": "Llac Ohrid, Macedònia del Nord",
+                "lat": 41.1231,
+                "lng": 20.8016,
+                "year": "2023",
+                "date": "22 de Juliol de 2023",
+                "description": "Pedalant entre pobles i llacs, amb una mirada oberta a les comunitats que ens acullen."
+            },
+            {
+                "id": 5,
+                "title": "Cims de la Patagònia",
+                "author": "Clara Rius",
+                "image": "/static/images/backgroundmountains.png",
+                "location": "Torres del Paine, Xile",
+                "lat": -50.9423,
+                "lng": -73.4068,
+                "year": "2022",
+                "date": "4 de Gener de 2022",
+                "description": "Una expedició de natura i fotografia per conèixer un dels paisatges més espectaculars del planeta."
+            },
+            {
+                "id": 6,
+                "title": "Desert i Estrelles",
+                "author": "Pau Soler",
+                "image": "/static/images/skyline.jpg",
+                "location": "Desert del Sàhara, Marroc",
+                "lat": 31.0994,
+                "lng": -4.0112,
+                "year": "2024",
+                "date": "15 de Març de 2024",
+                "description": "Nits sota les estrelles i una ruta de convivència amb famílies i guies del desert."
+            },
+            {
+                "id": 7,
+                "title": "Bosc Atlàntic",
+                "author": "Mireia Rovira",
+                "image": "/static/images/mountains_cutout.png",
+                "location": "Serra do Gerês, Portugal",
+                "lat": 41.8175,
+                "lng": -8.0386,
+                "year": "2023",
+                "date": "9 d'Octubre de 2023",
+                "description": "Exploració de senders i accions de restauració d'un bosc compartit amb una entitat local."
+            },
+            {
+                "id": 8,
+                "title": "Ruta de les Dolomites",
+                "author": "Oriol Noguera",
+                "image": "/static/images/backgroundmountains.png",
+                "location": "Cortina d'Ampezzo, Itàlia",
+                "lat": 46.5405,
+                "lng": 12.1357,
+                "year": "2025",
+                "date": "27 de Juny de 2025",
+                "description": "Una descoberta de parets, refugis i passos de muntanya feta a ritme de grup."
+            },
+            {
+                "id": 9,
+                "title": "Illes i Tramuntana",
+                "author": "Núria Comas",
+                "image": "/static/images/scout_foulard.jpg",
+                "location": "Serra de Tramuntana, Mallorca",
+                "lat": 39.7516,
+                "lng": 2.7088,
+                "year": "2024",
+                "date": "3 de Maig de 2024",
+                "description": "Camins costaners, pobles de pedra i una campanya per protegir els espais naturals de l'illa."
+            },
+            {
+                "id": 10,
+                "title": "Himàlaia Solidari",
+                "author": "Bernat Badia",
+                "image": "/static/images/skyline.jpg",
+                "location": "Pokhara, Nepal",
+                "lat": 28.2096,
+                "lng": 83.9856,
+                "year": "2022",
+                "date": "11 de Novembre de 2022",
+                "description": "Trobada internacional i projecte de suport a una escola de muntanya als peus de l'Annapurna."
+            },
+            {
+                "id": 11,
+                "title": "Camins de Montserrat",
+                "author": "Gemma Fortuny",
+                "image": "/static/images/backgroundmountains.png",
+                "location": "Montserrat, Catalunya",
+                "lat": 41.5931,
+                "lng": 1.8377,
+                "year": "2026",
+                "date": "8 de Gener de 2026",
+                "description": "Una ruta de descoberta pels camins de Montserrat, entre agulles, boscos i històries del país."
+            },
+            {
+                "id": 12,
+                "title": "Bivac al Montseny",
+                "author": "Judit Camps",
+                "image": "/static/images/mountains_cutout.png",
+                "location": "Turó de l'Home, Catalunya",
+                "lat": 41.7694,
+                "lng": 2.4447,
+                "year": "2026",
+                "date": "21 de Febrer de 2026",
+                "description": "Una nit d'hivern per practicar orientació, preparar el campament i escoltar el bosc."
+            },
+            {
+                "id": 13,
+                "title": "Volta al Cadí",
+                "author": "Ferran Dalmau",
+                "image": "/static/images/skyline.jpg",
+                "location": "Parc Natural del Cadí-Moixeró, Catalunya",
+                "lat": 42.2762,
+                "lng": 1.6994,
+                "year": "2026",
+                "date": "14 de Març de 2026",
+                "description": "Travessa de muntanya per conèixer la cara nord del Cadí i reforçar la confiança de l'equip."
+            },
+            {
+                "id": 14,
+                "title": "Racons del Delta",
+                "author": "Berta Canal",
+                "image": "/static/images/scout_foulard.jpg",
+                "location": "Delta de l'Ebre, Catalunya",
+                "lat": 40.7134,
+                "lng": 0.7347,
+                "year": "2026",
+                "date": "28 de Març de 2026",
+                "description": "Ruta en bicicleta per observar els aiguamolls i col·laborar en la cura d'aquest espai natural."
+            },
+            {
+                "id": 15,
+                "title": "Pedraforca en Equip",
+                "author": "Arnau Puig",
+                "image": "/static/images/backgroundmountains.png",
+                "location": "Pedraforca, Catalunya",
+                "lat": 42.2361,
+                "lng": 1.6882,
+                "year": "2026",
+                "date": "18 d'Abril de 2026",
+                "description": "Ascensió compartida i taller de seguretat per aprendre a preparar una sortida amb responsabilitat."
+            },
+            {
+                "id": 16,
+                "title": "Camí de Ronda",
+                "author": "Mireia Rovira",
+                "image": "/static/images/skyline.jpg",
+                "location": "Costa Brava, Catalunya",
+                "lat": 41.7185,
+                "lng": 3.0346,
+                "year": "2026",
+                "date": "2 de Maig de 2026",
+                "description": "Una travessa litoral per descobrir cales, cuidar els camins i viure la costa amb calma."
+            },
+            {
+                "id": 17,
+                "title": "Serra del Montsec",
+                "author": "Oriol Noguera",
+                "image": "/static/images/mountains_cutout.png",
+                "location": "Àger, Catalunya",
+                "lat": 42.0006,
+                "lng": 0.7653,
+                "year": "2026",
+                "date": "16 de Maig de 2026",
+                "description": "Cap de setmana de roca, cel fosc i observació de les estrelles des de la serra."
+            },
+            {
+                "id": 18,
+                "title": "Riu Ter a Peu",
+                "author": "Núria Comas",
+                "image": "/static/images/scout_foulard.jpg",
+                "location": "Rupit i Pruit, Catalunya",
+                "lat": 42.0244,
+                "lng": 2.4649,
+                "year": "2026",
+                "date": "30 de Maig de 2026",
+                "description": "Seguim el riu entre salts d'aigua i pobles per parlar del valor de l'aigua i el territori."
+            },
+            {
+                "id": 19,
+                "title": "Cingles de Bertí",
+                "author": "Clara Rius",
+                "image": "/static/images/backgroundmountains.png",
+                "location": "Sant Miquel del Fai, Catalunya",
+                "lat": 41.7167,
+                "lng": 2.2333,
+                "year": "2026",
+                "date": "13 de Juny de 2026",
+                "description": "Una caminada entre cingleres i rieres per descobrir la geologia del Vallès Oriental."
+            },
+            {
+                "id": 20,
+                "title": "Estanys de la Vall d'Aran",
+                "author": "Pau Soler",
+                "image": "/static/images/skyline.jpg",
+                "location": "Vielha, Catalunya",
+                "lat": 42.7028,
+                "lng": 0.7956,
+                "year": "2026",
+                "date": "27 de Juny de 2026",
+                "description": "Sortida d'alta muntanya per aprendre a llegir el temps i moure'ns amb prudència."
+            },
+            {
+                "id": 21,
+                "title": "Fageda d'en Jordà",
+                "author": "Laia Domènech",
+                "image": "/static/images/mountains_cutout.png",
+                "location": "La Garrotxa, Catalunya",
+                "lat": 42.1464,
+                "lng": 2.5161,
+                "year": "2026",
+                "date": "11 de Juliol de 2026",
+                "description": "Una passejada de descoberta per un bosc volcànic i les històries de la Garrotxa."
+            },
+            {
+                "id": 22,
+                "title": "Navegant pel Cap de Creus",
+                "author": "Guillem Pujol",
+                "image": "/static/images/scout_foulard.jpg",
+                "location": "Cap de Creus, Catalunya",
+                "lat": 42.3184,
+                "lng": 3.3155,
+                "year": "2026",
+                "date": "25 de Juliol de 2026",
+                "description": "Una sortida de mar i vent per conèixer el litoral i protegir els seus ecosistemes."
+            },
+            {
+                "id": 23,
+                "title": "Travessa del Montsec",
+                "author": "Aina Franquesa",
+                "image": "/static/images/backgroundmountains.png",
+                "location": "Congost de Mont-rebei, Catalunya",
+                "lat": 42.0875,
+                "lng": 0.6958,
+                "year": "2026",
+                "date": "8 d'Agost de 2026",
+                "description": "Camins penjats sobre el riu i una travessa per posar en pràctica el lideratge compartit."
+            },
+            {
+                "id": 24,
+                "title": "Nits de Pedra Seca",
+                "author": "Marc Vila",
+                "image": "/static/images/skyline.jpg",
+                "location": "Priorat, Catalunya",
+                "lat": 41.1454,
+                "lng": 0.8063,
+                "year": "2026",
+                "date": "22 d'Agost de 2026",
+                "description": "Ruta entre vinyes i cabanes de pedra seca amb un projecte de memòria rural."
+            },
+            {
+                "id": 25,
+                "title": "Cims de Núria",
+                "author": "Bernat Badia",
+                "image": "/static/images/mountains_cutout.png",
+                "location": "Queralbs, Catalunya",
+                "lat": 42.3981,
+                "lng": 2.1547,
+                "year": "2026",
+                "date": "5 de Setembre de 2026",
+                "description": "Un cap de setmana de cims, brúixola i convivència a la vall més alta del Ripollès."
+            },
+            {
+                "id": 26,
+                "title": "Camins del Pedraforca",
+                "author": "Judit Camps",
+                "image": "/static/images/scout_foulard.jpg",
+                "location": "Catalunya",
+                "lat": 42.2272,
+                "lng": 1.7358,
+                "year": "2026",
+                "date": "19 de Setembre de 2026",
+                "description": "Sortida de tardor per descobrir els boscos del Berguedà i cuinar plegats al refugi."
+            },
+            {
+                "id": 27,
+                "title": "Volta al Montgrí",
+                "author": "Ferran Dalmau",
+                "image": "/static/images/backgroundmountains.png",
+                "location": "L'Estartit, Catalunya",
+                "lat": 42.0492,
+                "lng": 3.1261,
+                "year": "2026",
+                "date": "3 d'Octubre de 2026",
+                "description": "Una ruta de costa i castells per començar el curs amb energia i mirada de grup."
+            },
+            {
+                "id": 28,
+                "title": "Castanyes al Montseny",
+                "author": "Berta Canal",
+                "image": "/static/images/mountains_cutout.png",
+                "location": "Santa Fe del Montseny, Catalunya",
+                "lat": 41.7741,
+                "lng": 2.4632,
+                "year": "2026",
+                "date": "17 d'Octubre de 2026",
+                "description": "Bosc, tardor i una tarda de descoberta per celebrar els primers dies de fred."
+            },
+            {
+                "id": 29,
+                "title": "Vies Verdes de Girona",
+                "author": "Arnau Puig",
+                "image": "/static/images/scout_foulard.jpg",
+                "location": "Girona, Catalunya",
+                "lat": 41.9794,
+                "lng": 2.8214,
+                "year": "2026",
+                "date": "7 de Novembre de 2026",
+                "description": "Pedalem per antigues vies de tren i connectem pobles, paisatge i comunitat."
+            },
+            {
+                "id": 30,
+                "title": "Hivern a la Cerdanya",
+                "author": "Gemma Fortuny",
+                "image": "/static/images/skyline.jpg",
+                "location": "Lles de Cerdanya, Catalunya",
+                "lat": 42.3906,
+                "lng": 1.6869,
+                "year": "2026",
+                "date": "12 de Desembre de 2026",
+                "description": "Raquetes, neu i una sortida per tancar l'any compartint reptes i paisatges."
+            }
+        ]
+
+        photo_pool = [
+            "/static/images/backgroundmountains.png",
+            "/static/images/mountains_cutout.png",
+            "/static/images/skyline.jpg",
+            "/static/images/scout_foulard.jpg"
+        ]
+        for index, expedition in enumerate(expeditions):
+            expedition["images"] = [
+                expedition["image"],
+                photo_pool[(index + 1) % len(photo_pool)],
+                photo_pool[(index + 2) % len(photo_pool)]
+            ]
+
+        return expeditions
+
+    def get_shop_products(self):
+        """Fetch e-commerce shop products from JSON store."""
+        records = self._read_data("shop.json", None)
+        if records and len(records) > 0:
+            return records
+        defaults = self._default_shop_products()
+        self._write_data("shop.json", defaults)
+        return defaults
+
+    def add_shop_product(self, data):
+        """Add a new product to the shop with complete input sanitization."""
+        products = self.get_shop_products()
+        next_id = max([p.get('id', 0) for p in products], default=0) + 1
+        price = sanitize_float(data.get('price', 0.0), default=0.0, min_val=0.0, max_val=100000.0)
+
+        new_prod = {
+            "id": next_id,
+            "name": sanitize_text(data.get('name', ''), max_length=200),
+            "price": price,
+            "category": sanitize_text(data.get('category', 'Material'), max_length=100),
+            "tag": sanitize_text(data.get('tag', 'NOU'), max_length=50).upper(),
+            "image": sanitize_url(data.get('image', '/static/images/scout_foulard.jpg')),
+            "description": sanitize_text(data.get('description', ''), max_length=5000, allow_newlines=True),
+            "in_stock": True if str(data.get('in_stock', 'true')).lower() in ['true', '1', 'on', 'yes'] else False
+        }
+        products.append(new_prod)
+        self._write_data("shop.json", products)
+        return new_prod
+
+    def update_shop_product(self, prod_id, data):
+        """Update an existing shop product by id with complete input sanitization."""
+        products = self.get_shop_products()
+        for idx, prod in enumerate(products):
+            if str(prod.get('id')) == str(prod_id):
+                if 'name' in data and data.get('name') is not None:
+                    prod['name'] = sanitize_text(data['name'], max_length=200)
+                if 'price' in data and data.get('price') != '':
+                    prod['price'] = sanitize_float(data['price'], default=prod.get('price', 0.0), min_val=0.0, max_val=100000.0)
+                if 'category' in data and data.get('category') is not None:
+                    prod['category'] = sanitize_text(data['category'], max_length=100)
+                if 'tag' in data and data.get('tag') is not None:
+                    prod['tag'] = sanitize_text(data['tag'], max_length=50).upper()
+                if data.get('image'):
+                    prod['image'] = sanitize_url(data['image'])
+                if 'description' in data and data.get('description') is not None:
+                    prod['description'] = sanitize_text(data['description'], max_length=5000, allow_newlines=True)
+                if 'in_stock' in data:
+                    prod['in_stock'] = True if str(data.get('in_stock')).lower() in ['true', '1', 'on', 'yes'] else False
+                products[idx] = prod
+                self._write_data("shop.json", products)
+                return prod
+        return None
+
+    def delete_shop_product(self, prod_id):
+        """Remove a shop product by id."""
+        products = self.get_shop_products()
+        products = [p for p in products if str(p.get('id')) != str(prod_id)]
+        self._write_data("shop.json", products)
+        return True
+
+    def _default_shop_products(self):
+        """Fetch e-commerce shop products for shop.html"""
+        records = self._fetch_sheet_records("Shop")
+        if records:
+            return records
+        
+        return [
+            {
+                "id": 1,
+                "name": "Foulard Oficial Lluïsos de Gràcia",
+                "price": 12.00,
+                "category": "Foulards",
+                "tag": "RETRO EDITION",
+                "image": "/static/images/scout_foulard.jpg",
+                "description": "El foulard tradicional de l'agrupament en blau marí i verd ampolla amb la sanefa cosida a mà.",
+                "in_stock": True
+            },
+            {
+                "id": 2,
+                "name": "Dessuadora Vintage Scouting",
+                "price": 32.00,
+                "category": "Roba",
+                "tag": "BESTSELLER",
+                "image": "/static/images/backgroundmountains.png",
+                "description": "Dessuadora de cotó d'alta gramatge amb caputxa i logotip de l'agrupament.",
+                "in_stock": True
+            }
+        ]
+
+    def get_cims(self):
+        """Retrieve peaks list from cims.json."""
+        records = self._read_data("cims.json", None)
+        if records and isinstance(records, list) and len(records) > 0:
+            return records
+        static_cims = os.path.join(self.base_dir, 'static', 'data', 'cims.json')
+        if os.path.exists(static_cims):
+            try:
+                with open(static_cims, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+                    self._write_data("cims.json", data)
+                    return data
+            except Exception:
+                pass
+        return []
+
+# Global DB Instance
+db = GSheetsDB()
