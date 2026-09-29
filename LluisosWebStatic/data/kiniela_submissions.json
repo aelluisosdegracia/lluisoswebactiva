@@ -1,0 +1,13 @@
+[
+  {
+    "id": 1,
+    "timestamp": "2026-09-05 21:19:21",
+    "creator_name": "Tester",
+    "assignments": {
+      "castors": [
+        "Cap1"
+      ]
+    },
+    "saved_online": false
+  }
+]
